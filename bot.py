@@ -11,11 +11,30 @@ order book. It does NOT trade until you set ENABLE_EXAMPLE_STRATEGY = True
 practice session while you watch what the callbacks print.
 
 Prices in fmclient are INTEGER CENTS, not dollars. $2.50 is 250.
+
+INVENTORY DISCIPLINE
+--------------------
+The manager issues a private order roughly every CYCLE_SECONDS. You must be
+back at your baseline unit count before the next one arrives, so every buy
+has to be paired with a sell inside the same cycle.
+
+The bot enforces this rather than trusting the strategy to behave:
+
+  * baseline units are captured from your first holdings update
+  * exposure is capped at MAX_OPEN_UNITS away from that baseline
+  * an open position must be closed before a new one is opened
+  * in the last UNWIND_BUFFER_SECONDS of a cycle it stops opening and
+    starts flattening, crossing the spread if that is what it takes
+  * a timer drives the unwind, so a quiet book cannot strand you long
+
+If a cycle still ends off baseline the bot logs it loudly -- that is the
+error you care about most in this setting.
 """
 
 import copy
 import json
 import os
+import time
 from pathlib import Path
 
 from fmclient import Agent, Holding, Market, Order, OrderSide, OrderType, Session
@@ -50,6 +69,29 @@ ENABLE_EXAMPLE_STRATEGY = False
 MAX_BUY_PRICE = 400  # never pay more than this
 MIN_SELL_PRICE = 600  # never sell for less than this
 ORDER_UNITS = 1
+
+# -- cycle / inventory discipline ------------------------------------------
+# How often the manager hands out a new private order. The bot also detects
+# the private order itself and resyncs the clock to it, so this is a fallback
+# for the first cycle and for any the detector misses.
+CYCLE_SECONDS = 60
+
+# Stop opening new positions and start flattening this many seconds before
+# the cycle ends. Needs to be long enough to actually get filled.
+UNWIND_BUFFER_SECONDS = 15
+
+# Units you may hold away from baseline at any moment. 1 means: buy one,
+# sell it back, and only then buy again.
+MAX_OPEN_UNITS = 1
+
+# Baseline unit count to return to before each new private order.
+# None = whatever you were holding when the bot first connected.
+TARGET_UNITS = None
+
+# When flattening at the end of a cycle, ignore MAX_BUY_PRICE / MIN_SELL_PRICE
+# and take the best price available. Being flat matters more than the last
+# cent. Set False to keep the limits and risk ending the cycle exposed.
+ALLOW_LOSS_TO_FLATTEN = True
 
 # Prints the real attribute names of the first Market / Holding / Order the
 # server sends, once each. Leave True for your first live run -- fmclient's
@@ -102,7 +144,21 @@ class MyBot(Agent):
 
         # Latest holdings, refreshed by received_holdings().
         self._cash_available = 0
+        self._units = 0
         self._units_available = 0
+
+        # Inventory discipline. _target_units is the baseline we must be
+        # back at before each new private order.
+        self._target_units = TARGET_UNITS
+        self._cycle_index = 0
+        self._cycle_start = None
+        self._buys_sent = 0
+        self._sells_sent = 0
+        self._seen_private = set()
+
+        # Last book seen, so the cycle timer can act without waiting for
+        # a book update that may never come.
+        self._book = []
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -127,10 +183,11 @@ class MyBot(Agent):
     def pre_start_tasks(self):
         """Register repeating jobs here, before the event loop starts.
 
-        Example -- run _heartbeat every 10 seconds:
-            self.execute_periodically(self._heartbeat, 10)
+        The cycle tick is what makes the unwind reliable: _on_book_update
+        only runs when the book changes, so a quiet market near the end of
+        a cycle would otherwise leave us holding a position.
         """
-        pass
+        self.execute_periodically(self._cycle_tick, 1)
 
     def received_session_info(self, session: Session):
         """Market opened, paused, or closed."""
@@ -155,12 +212,20 @@ class MyBot(Agent):
         for market, asset in (getattr(holdings, "assets", None) or {}).items():
             self._dump_attrs("Asset", asset)
             if self._is_my_market(market):
+                self._units = getattr(asset, "units", 0)
                 self._units_available = getattr(asset, "units_available", 0)
+
+        # Baseline: whatever we were holding the first time we heard.
+        if self._target_units is None:
+            self._target_units = self._units
+            self.inform(f"Baseline inventory set to {self._target_units} units. "
+                        f"Every cycle must end here.")
 
         self.inform(
             f"Holdings: cash={getattr(holdings, 'cash', '?')} "
             f"available={self._cash_available} "
-            f"units_available={self._units_available}"
+            f"units={self._units} (available {self._units_available}) "
+            f"net={self._net_units():+d} vs baseline"
         )
 
     def received_orders(self, orders):
@@ -175,13 +240,17 @@ class MyBot(Agent):
         if orders:
             self._dump_attrs("Order", orders[0])
 
+        self._detect_private_orders(orders)
+
         book = [o for o in orders if self._is_my_market(getattr(o, "market", None))]
+        self._book = book
         best_bid, best_ask = self._best_prices(book)
         mine = len(Order.my_current())
 
         self.inform(
             f"Book: best_bid={best_bid} best_ask={best_ask} "
-            f"({len(book)} orders, {mine} mine)"
+            f"({len(book)} orders, {mine} mine) "
+            f"net={self._net_units():+d} {self._seconds_left():.0f}s left"
         )
 
         self._on_book_update(book, best_bid, best_ask)
@@ -206,6 +275,10 @@ class MyBot(Agent):
           book      -- list of Order objects currently resting in this market
           best_bid  -- highest buy price in cents, or None
           best_ask  -- lowest sell price in cents, or None
+
+        The inventory rules are enforced before your logic runs: if you are
+        holding anything away from baseline, closing that comes first, and
+        nothing new is opened once the unwind window starts.
         """
         if not ENABLE_EXAMPLE_STRATEGY:
             return
@@ -215,18 +288,156 @@ class MyBot(Agent):
         if self.pending_outgoing_orders_count(self._market) > 0:
             return
 
-        # Example: cross the spread only when the price is clearly good for us.
+        net = self._net_units()
+        unwinding = self._seconds_left() <= UNWIND_BUFFER_SECONDS
+
+        # 1. An open position is a debt. Pay it before taking on more.
+        if net != 0:
+            self._reduce_exposure(net, best_bid, best_ask, forced=unwinding)
+            return
+
+        # 2. Flat, and too late to safely round-trip. Sit out the rest.
+        if unwinding:
+            return
+
+        # 3. Flat with time to spare -- open a position worth closing.
+        units = min(ORDER_UNITS, MAX_OPEN_UNITS)
+
         # Buy into a cheap ask.
         if best_ask is not None and best_ask <= MAX_BUY_PRICE:
-            if self._cash_available >= best_ask * ORDER_UNITS:
-                self._send_limit(OrderSide.BUY, best_ask, ORDER_UNITS)
+            if self._cash_available >= best_ask * units:
+                self._send_limit(OrderSide.BUY, best_ask, units)
                 return
 
         # Sell into an expensive bid.
         if best_bid is not None and best_bid >= MIN_SELL_PRICE:
-            if self._units_available >= ORDER_UNITS:
-                self._send_limit(OrderSide.SELL, best_bid, ORDER_UNITS)
+            if self._units_available >= units:
+                self._send_limit(OrderSide.SELL, best_bid, units)
                 return
+
+    def _reduce_exposure(self, net, best_bid, best_ask, forced):
+        """Move `net` units back toward baseline.
+
+        net > 0 means we are long and owe a sell; net < 0 means short and
+        owe a buy. `forced` drops the price limits -- late in a cycle, being
+        flat beats holding out for a better fill.
+        """
+        take_any_price = forced and ALLOW_LOSS_TO_FLATTEN
+
+        if net > 0:
+            if best_bid is None:
+                self.warning("Long but no bid to sell into.")
+                return
+            if not take_any_price and best_bid < MIN_SELL_PRICE:
+                return
+            units = min(net, self._units_available)
+            if units <= 0:
+                self.warning(f"Owe {net} sell but only {self._units_available} "
+                             f"units free -- cancelling resting orders.")
+                self._cancel_all_mine()
+                return
+            self._send_limit(OrderSide.SELL, best_bid, units)
+            return
+
+        need = -net
+        if best_ask is None:
+            self.warning("Short but no ask to buy from.")
+            return
+        if not take_any_price and best_ask > MAX_BUY_PRICE:
+            return
+        affordable = self._cash_available // best_ask if best_ask else 0
+        units = min(need, affordable)
+        if units <= 0:
+            self.warning(f"Owe {need} buy but cash only covers {affordable} "
+                         f"-- cancelling resting orders.")
+            self._cancel_all_mine()
+            return
+        self._send_limit(OrderSide.BUY, best_ask, units)
+
+    # -- cycle tracking ----------------------------------------------------
+
+    def _net_units(self):
+        """Units held away from baseline. + means we owe a sell."""
+        if self._target_units is None:
+            return 0
+        return self._units - self._target_units
+
+    def _seconds_left(self):
+        """Seconds remaining in the current cycle."""
+        if self._cycle_start is None:
+            return float(CYCLE_SECONDS)
+        return max(0.0, CYCLE_SECONDS - (time.time() - self._cycle_start))
+
+    def _detect_private_orders(self, orders):
+        """A new private order from the manager marks a new cycle."""
+        for order in orders:
+            if not getattr(order, "is_private", False):
+                continue
+            key = self._order_key(order)
+            if key in self._seen_private:
+                continue
+            self._seen_private.add(key)
+            self.inform(
+                f"PRIVATE ORDER: {getattr(order, 'order_side', '?')} "
+                f"{getattr(order, 'units', '?')}@{getattr(order, 'price', '?')}"
+            )
+            self._start_cycle()
+
+    def _order_key(self, order):
+        for attr in ("fm_id", "id", "ref"):
+            value = getattr(order, attr, None)
+            if value is not None:
+                return (attr, value)
+        return ("obj", id(order))
+
+    def _start_cycle(self):
+        """Close the books on the last cycle and start the clock on a new one."""
+        if self._cycle_index:
+            net = self._net_units()
+            summary = (f"Cycle {self._cycle_index} done: "
+                       f"{self._buys_sent} buys / {self._sells_sent} sells sent, "
+                       f"ending net {net:+d}")
+            if net == 0:
+                self.inform(summary + " -- back at baseline.")
+            else:
+                self.error(summary + " -- OFF BASELINE, unpaired position.")
+
+        self._cycle_index += 1
+        self._cycle_start = time.time()
+        self._buys_sent = 0
+        self._sells_sent = 0
+        self.inform(f"--- Cycle {self._cycle_index} ---")
+
+    def _cycle_tick(self):
+        """Runs every second. Drives the unwind and rolls the cycle over."""
+        if self._cycle_start is None:
+            if self._market is not None:
+                self._start_cycle()
+            return
+
+        if self._seconds_left() <= 0:
+            self._start_cycle()
+            return
+
+        if self._seconds_left() > UNWIND_BUFFER_SECONDS:
+            return
+
+        net = self._net_units()
+        if net == 0 or not ENABLE_EXAMPLE_STRATEGY:
+            return
+        if not self.is_session_active():
+            return
+        if self.pending_outgoing_orders_count(self._market) > 0:
+            return
+
+        # Resting orders tie up the units and cash we need to get flat.
+        if Order.my_current():
+            self._cancel_all_mine()
+            return
+
+        best_bid, best_ask = self._best_prices(self._book)
+        self.warning(f"UNWIND: {net:+d} units, {self._seconds_left():.0f}s left")
+        self._reduce_exposure(net, best_bid, best_ask, forced=True)
 
     # -- helpers -----------------------------------------------------------
 
@@ -285,9 +496,17 @@ class MyBot(Agent):
         order.order_side = side
 
         self._order_count += 1
-        order.ref = f"{BOT_NAME}-{self._order_count}"
+        order.ref = f"{BOT_NAME}-c{self._cycle_index}-{self._order_count}"
 
-        self.inform(f"Sending {side} {units}@{price} (ref={order.ref})")
+        if side == OrderSide.BUY:
+            self._buys_sent += units
+            projected = self._net_units() + units
+        else:
+            self._sells_sent += units
+            projected = self._net_units() - units
+
+        self.inform(f"Sending {side} {units}@{price} (ref={order.ref}) "
+                    f"net {self._net_units():+d} -> {projected:+d} if filled")
         self.send_order(order)
 
     def _cancel(self, order: Order):
@@ -322,8 +541,9 @@ class MyBot(Agent):
 
     def _heartbeat(self):
         """Sample periodic task -- see pre_start_tasks()."""
-        self.inform(f"Alive. cash_available={self._cash_available} "
-                    f"units_available={self._units_available}")
+        self.inform(f"Cycle {self._cycle_index}, {self._seconds_left():.0f}s left. "
+                    f"units={self._units} (baseline {self._target_units}, "
+                    f"net {self._net_units():+d}) cash={self._cash_available}")
 
 
 if __name__ == "__main__":

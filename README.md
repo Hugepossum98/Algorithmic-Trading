@@ -140,6 +140,45 @@ first market, holding, and order the server sends, once each, tagged
 log. Every ORM read goes through a `getattr` default, so a name that doesn't
 match logs `?` rather than crashing the bot mid-session.
 
+## Inventory discipline (the cycle rule)
+
+The manager hands out a private order roughly every 60 seconds, and you must
+be back at your baseline unit count before the next one lands. Every buy has
+to be paired with a sell inside the same cycle.
+
+`bot.py` enforces this rather than trusting the strategy to remember:
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `CYCLE_SECONDS` | `60` | Expected gap between private orders |
+| `UNWIND_BUFFER_SECONDS` | `15` | Stop opening, start flattening, this far from the end |
+| `MAX_OPEN_UNITS` | `1` | How far from baseline you may ever be |
+| `TARGET_UNITS` | `None` | Baseline; `None` captures whatever you hold at connect |
+| `ALLOW_LOSS_TO_FLATTEN` | `True` | Cross the spread if that's what being flat costs |
+
+How it behaves:
+
+1. **Baseline** is captured from your first holdings update and logged.
+2. **An open position is a debt.** While `net != 0` the bot only trades in the
+   direction that closes it — a cheap ask is ignored when you're already long.
+3. **Late in a cycle it stops opening.** Inside the unwind window, a flat bot
+   sits still rather than starting a round trip it can't finish.
+4. **The unwind is timer-driven**, not book-driven. `_on_book_update` only
+   fires when the book moves, so a quiet market would otherwise strand you
+   holding units. `_cycle_tick` runs every second regardless.
+5. **Resting orders get cancelled first** when flattening — they tie up the
+   very units and cash needed to get flat.
+6. **A cycle ending off baseline logs an error**, with the buy/sell counts. In
+   this setting that's the failure that matters most.
+
+Cycle boundaries are detected from the manager's order itself via
+`order.is_private`, with `CYCLE_SECONDS` as the fallback clock.
+
+`ALLOW_LOSS_TO_FLATTEN = True` means the bot will deliberately sell into a bad
+bid rather than carry a position across the boundary. That is usually the
+right trade in this setting, but it is a real cost — set it `False` if your
+lecturer's rules say otherwise.
+
 ## Writing your strategy
 
 Everything lives in one method:
