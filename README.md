@@ -10,19 +10,50 @@ Python bot template for the class trading sessions, built on `fmclient`.
 
 ## Setup
 
-`fmclient` is **not on PyPI** — download the wheel from Canvas first.
+`fmclient` is **not on PyPI** — download the wheel from Canvas first, and note
+where it saved (usually `Downloads`).
 
-```bash
-# 1. virtual environment (recommended over installing into system python)
-python3 -m venv venv
-source venv/bin/activate          # Windows: venv\Scripts\activate
+Use a virtual environment. Beyond being good practice, it guarantees `python`
+and `pip` refer to the *same* interpreter — if you have several Pythons
+installed, they often don't, and packages get installed where your script
+can't see them.
 
-# 2. install the wheel you downloaded from Canvas
-pip install ./fmclient-<version>-py3-none-any.whl
+fmclient is an older library, so prefer Python 3.11 or 3.12 if you have one.
+Very new versions (3.13+) frequently have no compatible build.
 
-# 3. verify
+### Windows (PowerShell)
+
+```powershell
+py -0                             # list your installed Pythons
+py -3.12 -m venv venv             # or py -3.11, or just py
+.\venv\Scripts\Activate.ps1       # prompt should now start with (venv)
+
+# use the REAL filename -- type "fmc" and press Tab to autocomplete
+pip install "$HOME\Downloads\fmclient-2.0.0-py3-none-any.whl"
+
 python check_setup.py
 ```
+
+If activation fails with an execution-policy error, allow it for that window
+only: `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass`
+
+### macOS / Linux
+
+```bash
+python3 -m venv venv
+source venv/bin/activate          # prompt should now start with (venv)
+
+# use the REAL filename of the wheel you downloaded
+pip install ~/Downloads/fmclient-2.0.0-py3-none-any.whl
+
+python check_setup.py
+```
+
+Both blocks show `fmclient-2.0.0-py3-none-any.whl` as an example — substitute
+whatever the Canvas file is actually called. Run `pip install` on a path that
+exists, or pip will tell you the file isn't there.
+
+Reactivate the venv (the activate line) in every new terminal you open.
 
 `check_setup.py` prints the API of the version you installed. If it reports
 `MISSING` for anything, the Canvas wheel differs from this template — adjust
@@ -30,8 +61,11 @@ python check_setup.py
 
 ## Credentials
 
+```powershell
+Copy-Item credentials.example.json credentials.json   # PowerShell
+```
 ```bash
-cp credentials.example.json credentials.json
+cp credentials.example.json credentials.json          # macOS / Linux
 ```
 
 Fill in your account name, email, password, and the marketplace id given in
