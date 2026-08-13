@@ -76,11 +76,46 @@ for enum_name in ["OrderSide", "OrderType"]:
         members = [m for m in dir(enum) if m.isupper()]
         print(f"\n{enum_name} members: {', '.join(members)}")
 
+# --- full surface, so a mismatch can be diagnosed from one run -------------
+if missing_names or missing_methods:
+    print("\n" + "=" * 70)
+    print("Mismatch detected -- dumping the full API of this version.")
+    print("=" * 70)
+
+    public = [n for n in dir(fmclient) if not n.startswith("_")]
+    print(f"\nAll public names in fmclient ({len(public)}):")
+    for name in public:
+        obj = getattr(fmclient, name)
+        kind = type(obj).__name__
+        print(f"  {name}  [{kind}]")
+
+    agent_cls = getattr(fmclient, "Agent", None)
+    if agent_cls is not None:
+        print("\nEvery public Agent member:")
+        for name in sorted(n for n in dir(agent_cls) if not n.startswith("_")):
+            attr = getattr(agent_cls, name, None)
+            try:
+                sig = str(inspect.signature(attr)) if callable(attr) else ""
+            except (TypeError, ValueError):
+                sig = "(?)"
+            print(f"  {name}{sig}")
+
+    order_cls = getattr(fmclient, "Order", None)
+    if order_cls is not None:
+        print("\nEvery public Order member:")
+        for name in sorted(n for n in dir(order_cls) if not n.startswith("_")):
+            attr = getattr(order_cls, name, None)
+            try:
+                sig = str(inspect.signature(attr)) if callable(attr) else ""
+            except (TypeError, ValueError):
+                sig = ""
+            print(f"  {name}{sig}")
+
 # --- verdict ---------------------------------------------------------------
 print()
 if missing_names or missing_methods:
     print("RESULT: fmclient imports, but the API differs from bot.py.")
-    print("        Update bot.py to use the names printed above.")
+    print("        Send the dump above to reconcile bot.py with this version.")
     sys.exit(1)
 
 print("RESULT: setup looks good. bot.py matches this fmclient version.")
