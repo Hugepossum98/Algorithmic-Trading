@@ -35,16 +35,16 @@ from fmclient import Agent, Holding, Market, Order, OrderSide, OrderType, Sessio
 #     "marketplace_id": 1234
 #   }
 
-ACCOUNT = "<your account name>"
-EMAIL = "<your email>"
-PASSWORD = "<your password>"
-MARKETPLACE_ID = 0  # integer id given in class
+ACCOUNT = "jocund-value"
+EMAIL = "jvandersteen@student.unimelb.edu.au"
+PASSWORD = ""
+MARKETPLACE_ID = 3265  # integer id given in class
 
 BOT_NAME = "MyBot"
 
 # Safety switch. Leave False until you have read what the example does and
 # you actually want the bot placing live orders.
-ENABLE_EXAMPLE_STRATEGY = False
+ENABLE_EXAMPLE_STRATEGY = True
 
 # Example-strategy parameters (all in cents).
 MAX_BUY_PRICE = 400  # never pay more than this
@@ -90,50 +90,50 @@ def load_credentials():
 
 
 class MyBot(Agent):
-    """One callback per event from the marketplace. Override what you need."""
+    """Robust Multi-Market Arbitrage Bot"""
 
     def __init__(self, account, email, password, marketplace_id):
         super().__init__(account, email, password, marketplace_id, name=BOT_NAME)
 
-        # The market we trade. Set in initialised() once we see what exists.
-        self._market = None
+        # We now track TWO markets
+        self._public_market = None
+        self._private_market = None
+        
         self._order_count = 0
         self._dumped = set()
-
-        # Latest holdings, refreshed by received_holdings().
         self._cash_available = 0
         self._units_available = 0
 
     # -- lifecycle ---------------------------------------------------------
 
     def initialised(self):
-        """Called once after login, when market metadata has arrived."""
+        """Called once after login. Identify Private vs Public markets."""
         for market_id, market in self.markets.items():
-            self.inform(
-                f"Market {market_id}: item={getattr(market, 'item', '?')} "
-                f"min={getattr(market, 'min_price', '?')} "
-                f"max={getattr(market, 'max_price', '?')} "
-                f"tick={getattr(market, 'tick', '?')}"
-            )
+            item_name = getattr(market, 'item', '?')
+            self.inform(f"Market {market_id} visible: item={item_name}")
+            
+            # Heuristic: The private market usually has your account name or 'private' in it.
+            if ACCOUNT.lower() in item_name.lower() or 'private' in item_name.lower():
+                self._private_market = market
+            else:
+                self._public_market = market
 
-        # Single-market sessions: just take the one we were given.
-        self._market = next(iter(self.markets.values()), None)
-        if self._market is None:
-            self.error("No markets visible for this marketplace id.")
+        # Fallback if the naming convention is completely different
+        if not self._private_market and len(self.markets) >= 2:
+            markets_list = list(self.markets.values())
+            self._private_market = markets_list[0]
+            self._public_market = markets_list[1]
+
+        if not self._public_market or not self._private_market:
+            self.error("CRITICAL: Could not find both a Public and Private market!")
         else:
-            self.inform(f"Trading market: {getattr(self._market, 'item', '?')}")
-            self._dump_attrs("Market", self._market)
+            self.inform(f"Assigned PRIVATE market: {getattr(self._private_market, 'item', '?')}")
+            self.inform(f"Assigned PUBLIC market: {getattr(self._public_market, 'item', '?')}")
 
     def pre_start_tasks(self):
-        """Register repeating jobs here, before the event loop starts.
-
-        Example -- run _heartbeat every 10 seconds:
-            self.execute_periodically(self._heartbeat, 10)
-        """
         pass
 
     def received_session_info(self, session: Session):
-        """Market opened, paused, or closed."""
         if getattr(session, "is_open", False):
             state = "OPEN"
         elif getattr(session, "is_paused", False):
@@ -142,49 +142,37 @@ class MyBot(Agent):
             state = "CLOSED"
         else:
             state = "UNKNOWN"
-
         self.inform(f"Session {state} (active={self.is_session_active()})")
 
     # -- market data -------------------------------------------------------
 
     def received_holdings(self, holdings: Holding):
-        """Your cash and units. 'available' excludes what is tied up in orders."""
-        self._dump_attrs("Holding", holdings)
-
+        """Tracks total cash and aggregates units across all markets."""
         self._cash_available = getattr(holdings, "cash_available", 0)
+        
+        total_units = 0
         for market, asset in (getattr(holdings, "assets", None) or {}).items():
-            self._dump_attrs("Asset", asset)
-            if self._is_my_market(market):
-                self._units_available = getattr(asset, "units_available", 0)
+            total_units += getattr(asset, "units_available", 0)
+        
+        self._units_available = total_units
 
         self.inform(
-            f"Holdings: cash={getattr(holdings, 'cash', '?')} "
-            f"available={self._cash_available} "
-            f"units_available={self._units_available}"
+            f"Holdings: cash_available={self._cash_available} "
+            f"total_units_available={self._units_available}"
         )
 
     def received_orders(self, orders):
-        """The current order book, resent on every change.
-
-        `orders` is the whole book, not a delta. Use Order.my_current() to
-        see just your own live orders.
-        """
-        if self._market is None:
+        """Split the master order book into Public and Private books."""
+        if not self._public_market or not self._private_market:
             return
 
-        if orders:
+        if orders and "Order" not in self._dumped:
             self._dump_attrs("Order", orders[0])
 
-        book = [o for o in orders if self._is_my_market(getattr(o, "market", None))]
-        best_bid, best_ask = self._best_prices(book)
-        mine = len(Order.my_current())
+        pub_book = [o for o in orders if getattr(o, "market", None) == self._public_market]
+        priv_book = [o for o in orders if getattr(o, "market", None) == self._private_market]
 
-        self.inform(
-            f"Book: best_bid={best_bid} best_ask={best_ask} "
-            f"({len(book)} orders, {mine} mine)"
-        )
-
-        self._on_book_update(book, best_bid, best_ask)
+        self._on_books_update(pub_book, priv_book)
 
     # -- order feedback ----------------------------------------------------
 
@@ -194,56 +182,109 @@ class MyBot(Agent):
                     f"{getattr(order, 'units', '?')}@{getattr(order, 'price', '?')}")
 
     def order_rejected(self, info: dict, order: Order):
-        """`info` is a dict explaining why -- always read it."""
         self.error(f"Order REJECTED: ref={getattr(order, 'ref', None)} -- {info}")
 
     # -- strategy ----------------------------------------------------------
 
-    def _on_book_update(self, book, best_bid, best_ask):
-        """YOUR STRATEGY GOES HERE.
-
-        Called on every book update with:
-          book      -- list of Order objects currently resting in this market
-          best_bid  -- highest buy price in cents, or None
-          best_ask  -- lowest sell price in cents, or None
-        """
+    def _on_books_update(self, pub_book, priv_book):
+        """CUTTHROAT ARBITRAGE STRATEGY - V2"""
         if not ENABLE_EXAMPLE_STRATEGY:
             return
 
-        # Don't stack orders: wait for anything in flight to be accepted or
-        # rejected first, otherwise the marketplace rejects the extras.
-        if self.pending_outgoing_orders_count(self._market) > 0:
+        # 1. Speed Check
+        if self.pending_outgoing_orders_count(self._public_market) > 0 or \
+           self.pending_outgoing_orders_count(self._private_market) > 0:
             return
 
-        # Example: cross the spread only when the price is clearly good for us.
-        # Buy into a cheap ask.
-        if best_ask is not None and best_ask <= MAX_BUY_PRICE:
-            if self._cash_available >= best_ask * ORDER_UNITS:
-                self._send_limit(OrderSide.BUY, best_ask, ORDER_UNITS)
+        my_orders = list(Order.my_current().values())
+        my_pub_orders = [o for o in my_orders if o.market == self._public_market]
+        my_priv_orders = [o for o in my_orders if o.market == self._private_market]
+
+        other_pub = [o for o in pub_book if o.ref not in [m.ref for m in my_orders]]
+        other_priv = [o for o in priv_book if o.ref not in [m.ref for m in my_orders]]
+
+        pub_best_bid, pub_best_ask = self._best_prices(other_pub)
+        priv_best_bid, priv_best_ask = self._best_prices(other_priv)
+
+        tick = getattr(self._public_market, "tick", 1)
+        max_pub_units = getattr(self._public_market, "unitMaximum", ORDER_UNITS)
+
+        # ------------------------------------------------------------------
+        # PRIORITY 1: CUTTHROAT INVENTORY DUMPING (With Dynamic Repricing)
+        # ------------------------------------------------------------------
+        if self._units_available > 0:
+            # Determine our ideal undercut price
+            if pub_best_ask:
+                ideal_price = pub_best_ask - tick
+                if pub_best_bid and ideal_price <= pub_best_bid:
+                    ideal_price = pub_best_bid
+            else:
+                ideal_price = pub_best_bid if pub_best_bid else MIN_SELL_PRICE
+
+            # STALE ORDER CHECK: If our active order isn't at the ideal price, cancel it
+            if my_pub_orders:
+                for order in my_pub_orders:
+                    if order.order_side == OrderSide.SELL and order.price != ideal_price:
+                        self._cancel(order)
+                        return # Let the server process the cancel before placing a new one
+                return # If our order is at the perfect price, wait for the fill
+
+            # Slice and Send
+            units_to_sell = min(self._units_available, max_pub_units)
+            self._send_limit(self._public_market, OrderSide.SELL, ideal_price, units_to_sell)
+            return
+
+        if self._units_available < 0:
+            # Determine our ideal penny-jump price
+            if pub_best_bid:
+                ideal_price = pub_best_bid + tick
+                if pub_best_ask and ideal_price >= pub_best_ask:
+                    ideal_price = pub_best_ask
+            else:
+                ideal_price = pub_best_ask if pub_best_ask else MAX_BUY_PRICE
+
+            # STALE ORDER CHECK
+            if my_pub_orders:
+                for order in my_pub_orders:
+                    if order.order_side == OrderSide.BUY and order.price != ideal_price:
+                        self._cancel(order)
+                        return
                 return
 
-        # Sell into an expensive bid.
-        if best_bid is not None and best_bid >= MIN_SELL_PRICE:
-            if self._units_available >= ORDER_UNITS:
-                self._send_limit(OrderSide.SELL, best_bid, ORDER_UNITS)
-                return
+            units_to_buy = min(abs(self._units_available), max_pub_units)
+            self._send_limit(self._public_market, OrderSide.BUY, ideal_price, units_to_buy)
+            return
+
+        # ------------------------------------------------------------------
+        # PRIORITY 2: THE ARBITRAGE SNIPE
+        # ------------------------------------------------------------------
+        if self._units_available == 0:
+            # Manager is selling cheap -> We BUY from Private.
+            # (Inventory goes >0, Priority 1 will dump to Public)
+            if priv_best_ask and pub_best_bid and priv_best_ask < pub_best_bid:
+                if self._cash_available >= priv_best_ask * max_pub_units and not my_priv_orders:
+                    self.inform(f"SNIPING MANAGER ASK: Buying @ {priv_best_ask}")
+                    self._send_limit(self._private_market, OrderSide.BUY, priv_best_ask, ORDER_UNITS)
+                    return
+
+            # Manager is buying high -> We SHORT SELL to Private.
+            # (Inventory goes <0, Priority 1 will buy back from Public)
+            if priv_best_bid and pub_best_ask and priv_best_bid > pub_best_ask:
+                if not my_priv_orders:
+                    self.inform(f"SNIPING MANAGER BID: Selling short to Manager @ {priv_best_bid}")
+                    self._send_limit(self._private_market, OrderSide.SELL, priv_best_bid, ORDER_UNITS)
+                    return
 
     # -- helpers -----------------------------------------------------------
 
     def _dump_attrs(self, label, obj):
-        """Print an object's real attributes, once per label.
-
-        fmclient's ORM classes build their attributes at runtime, so this is
-        the only reliable way to learn the exact names. Set
-        DEBUG_DUMP_ATTRS = False once you've seen them.
-        """
         if not DEBUG_DUMP_ATTRS or obj is None or label in self._dumped:
             return
         self._dumped.add(label)
 
         try:
             attrs = dict(vars(obj))
-        except TypeError:  # __slots__ or a C type
+        except TypeError:
             attrs = {
                 name: getattr(obj, name, None)
                 for name in dir(obj)
@@ -254,31 +295,22 @@ class MyBot(Agent):
         for name, value in sorted(attrs.items()):
             self.inform(f"[attrs]   {name} = {value!r}")
 
-    def _is_my_market(self, market):
-        """True if `market` is the one we trade."""
-        if market is None or self._market is None:
-            return False
-        if market is self._market:
-            return True
-        mine = getattr(self._market, "fm_id", None)
-        return mine is not None and getattr(market, "fm_id", None) == mine
-
     def _best_prices(self, book):
         bids = [o.price for o in book if o.order_side == OrderSide.BUY]
         asks = [o.price for o in book if o.order_side == OrderSide.SELL]
         return (max(bids) if bids else None, min(asks) if asks else None)
 
-    def _send_limit(self, side, price, units):
-        """Build and send a limit order, with basic sanity checks."""
+    def _send_limit(self, market, side, price, units):
+        """Build and send a limit order to a SPECIFIC market."""
         if not self.is_session_active():
             self.warning("Session not active -- not sending.")
             return
 
-        price = self._clamp_to_tick(price)
+        price = self._clamp_to_tick(market, price)
         if price is None:
             return
 
-        order = Order.create_new(self._market)
+        order = Order.create_new(market)
         order.price = price
         order.units = units
         order.order_type = OrderType.LIMIT
@@ -287,15 +319,11 @@ class MyBot(Agent):
         self._order_count += 1
         order.ref = f"{BOT_NAME}-{self._order_count}"
 
-        self.inform(f"Sending {side} {units}@{price} (ref={order.ref})")
+        market_name = getattr(market, 'item', 'Unknown')
+        self.inform(f"Sending to {market_name}: {side} {units}@{price} (ref={order.ref})")
         self.send_order(order)
 
     def _cancel(self, order: Order):
-        """Cancel a live order of yours.
-
-        fmclient 6 has no Order.create_cancel(): you copy the order you want
-        gone and flip its type to OrderType.CANCEL.
-        """
         cancel = copy.copy(order)
         cancel.order_type = OrderType.CANCEL
         cancel.ref = f"cancel-{getattr(order, 'ref', 'order')}"
@@ -303,13 +331,10 @@ class MyBot(Agent):
         self.send_order(cancel)
 
     def _cancel_all_mine(self):
-        """Pull all of your resting orders. Handy at session end."""
         for order in Order.my_current().values():
             self._cancel(order)
 
-    def _clamp_to_tick(self, price):
-        """Round to the market tick and reject prices outside the legal range."""
-        market = self._market
+    def _clamp_to_tick(self, market, price):
         tick = getattr(market, "tick", None) or 1
         price = int(round(price / tick) * tick)
 
@@ -321,9 +346,7 @@ class MyBot(Agent):
         return price
 
     def _heartbeat(self):
-        """Sample periodic task -- see pre_start_tasks()."""
-        self.inform(f"Alive. cash_available={self._cash_available} "
-                    f"units_available={self._units_available}")
+        self.inform(f"Alive. cash_available={self._cash_available} units_available={self._units_available}")
 
 
 if __name__ == "__main__":
