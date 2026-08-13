@@ -51,6 +51,11 @@ MAX_BUY_PRICE = 400  # never pay more than this
 MIN_SELL_PRICE = 600  # never sell for less than this
 ORDER_UNITS = 1
 
+# Prints the real attribute names of the first Market / Holding / Order the
+# server sends, once each. Leave True for your first live run -- fmclient's
+# ORM builds attributes dynamically, so this is the only way to see them.
+DEBUG_DUMP_ATTRS = True
+
 
 def load_credentials():
     """Env vars > credentials.json > the placeholders above."""
@@ -93,6 +98,7 @@ class MyBot(Agent):
         # The market we trade. Set in initialised() once we see what exists.
         self._market = None
         self._order_count = 0
+        self._dumped = set()
 
         # Latest holdings, refreshed by received_holdings().
         self._cash_available = 0
@@ -116,6 +122,7 @@ class MyBot(Agent):
             self.error("No markets visible for this marketplace id.")
         else:
             self.inform(f"Trading market: {getattr(self._market, 'item', '?')}")
+            self._dump_attrs("Market", self._market)
 
     def pre_start_tasks(self):
         """Register repeating jobs here, before the event loop starts.
@@ -126,18 +133,27 @@ class MyBot(Agent):
         pass
 
     def received_session_info(self, session: Session):
-        """Market opened or closed."""
-        if self.is_session_active():
-            self.inform("Session is ACTIVE -- trading allowed.")
+        """Market opened, paused, or closed."""
+        if getattr(session, "is_open", False):
+            state = "OPEN"
+        elif getattr(session, "is_paused", False):
+            state = "PAUSED"
+        elif getattr(session, "is_closed", False):
+            state = "CLOSED"
         else:
-            self.inform("Session is INACTIVE -- orders will be rejected.")
+            state = "UNKNOWN"
+
+        self.inform(f"Session {state} (active={self.is_session_active()})")
 
     # -- market data -------------------------------------------------------
 
     def received_holdings(self, holdings: Holding):
         """Your cash and units. 'available' excludes what is tied up in orders."""
+        self._dump_attrs("Holding", holdings)
+
         self._cash_available = getattr(holdings, "cash_available", 0)
         for market, asset in (getattr(holdings, "assets", None) or {}).items():
+            self._dump_attrs("Asset", asset)
             if self._is_my_market(market):
                 self._units_available = getattr(asset, "units_available", 0)
 
@@ -155,6 +171,9 @@ class MyBot(Agent):
         """
         if self._market is None:
             return
+
+        if orders:
+            self._dump_attrs("Order", orders[0])
 
         book = [o for o in orders if self._is_my_market(getattr(o, "market", None))]
         best_bid, best_ask = self._best_prices(book)
@@ -210,6 +229,30 @@ class MyBot(Agent):
                 return
 
     # -- helpers -----------------------------------------------------------
+
+    def _dump_attrs(self, label, obj):
+        """Print an object's real attributes, once per label.
+
+        fmclient's ORM classes build their attributes at runtime, so this is
+        the only reliable way to learn the exact names. Set
+        DEBUG_DUMP_ATTRS = False once you've seen them.
+        """
+        if not DEBUG_DUMP_ATTRS or obj is None or label in self._dumped:
+            return
+        self._dumped.add(label)
+
+        try:
+            attrs = dict(vars(obj))
+        except TypeError:  # __slots__ or a C type
+            attrs = {
+                name: getattr(obj, name, None)
+                for name in dir(obj)
+                if not name.startswith("_") and not callable(getattr(obj, name, None))
+            }
+
+        self.inform(f"[attrs] {label} ({type(obj).__name__}):")
+        for name, value in sorted(attrs.items()):
+            self.inform(f"[attrs]   {name} = {value!r}")
 
     def _is_my_market(self, market):
         """True if `market` is the one we trade."""

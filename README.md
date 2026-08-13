@@ -131,6 +131,15 @@ that API:
 
 Re-run `check_setup.py` if the wheel is ever updated.
 
+fmclient's ORM classes (`Market`, `Holding`, `Asset`) build their attributes
+at runtime, so `check_setup.py` can't confirm names like `market.tick` or
+`holdings.cash_available` — only a live connection can. `bot.py` therefore
+ships with `DEBUG_DUMP_ATTRS = True`, which prints the real attributes of the
+first market, holding, and order the server sends, once each, tagged
+`[attrs]`. Read those on your first run, then set it to `False` to quiet the
+log. Every ORM read goes through a `getattr` default, so a name that doesn't
+match logs `?` rather than crashing the bot mid-session.
+
 ## Writing your strategy
 
 Everything lives in one method:
