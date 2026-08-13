@@ -1,0 +1,26 @@
+# Never commit credentials
+credentials.json
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# fmclient wheel from Canvas (not redistributable)
+*.whl
+*.tar.gz
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Logs written by fmclient
+*.log
+logs/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store

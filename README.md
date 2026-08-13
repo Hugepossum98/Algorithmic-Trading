@@ -1,0 +1,98 @@
+# Algorithmic Trading — AdHocMarkets bot
+
+Python bot template for the class trading sessions, built on `fmclient`.
+
+| File | What it's for |
+| --- | --- |
+| `bot.py` | The bot. Edit the CONFIG block and `_on_book_update()`. |
+| `check_setup.py` | Run before class — confirms `fmclient` is installed and matches `bot.py`. |
+| `credentials.example.json` | Copy to `credentials.json` (git-ignored) and fill in. |
+
+## Setup
+
+`fmclient` is **not on PyPI** — download the wheel from Canvas first.
+
+```bash
+# 1. virtual environment (recommended over installing into system python)
+python3 -m venv venv
+source venv/bin/activate          # Windows: venv\Scripts\activate
+
+# 2. install the wheel you downloaded from Canvas
+pip install ./fmclient-<version>-py3-none-any.whl
+
+# 3. verify
+python check_setup.py
+```
+
+`check_setup.py` prints the API of the version you installed. If it reports
+`MISSING` for anything, the Canvas wheel differs from this template — adjust
+`bot.py` to use the names it printed.
+
+## Credentials
+
+```bash
+cp credentials.example.json credentials.json
+```
+
+Fill in your account name, email, password, and the marketplace id given in
+class. `credentials.json` is git-ignored, so your password stays out of the
+repo. Environment variables (`FM_ACCOUNT`, `FM_EMAIL`, `FM_PASSWORD`,
+`FM_MARKETPLACE_ID`) override the file if you prefer those.
+
+## Running
+
+```bash
+python bot.py
+```
+
+On startup the bot logs in, prints every market it can see, prints your
+holdings, and then prints the order book on each update. **It places no
+orders** until you set `ENABLE_EXAMPLE_STRATEGY = True` in `bot.py` or write
+your own logic — so it's safe to run while you watch the callbacks fire.
+
+## How fmclient calls your code
+
+`Agent` is event-driven: you don't poll, you override callbacks.
+
+| Callback | Fires when |
+| --- | --- |
+| `initialised()` | Once after login, when market metadata has arrived. |
+| `pre_start_tasks()` | Once before the event loop — register periodic jobs here. |
+| `received_session_info(session)` | Market opens or closes. |
+| `received_holdings(holdings)` | Your cash/units change. |
+| `received_orders(orders)` | The order book changes. |
+| `order_accepted(order)` | Your order reached the book. |
+| `order_rejected(info, order)` | Your order was refused — read `info`. |
+
+## Things that cost people money last session
+
+- **Prices are integer cents.** `250` is $2.50. Sending `2.50` will be rejected
+  or mispriced.
+- **`received_orders` gives you the whole book every time**, not a delta. Don't
+  treat each callback as "new" orders.
+- **One order in flight at a time.** Sending another before the first is
+  accepted gets it rejected. `bot.py` tracks this with `_pending_ref`.
+- **Check `cash_available` / `units_available`, not `cash` / `units`.** The
+  difference is what's already committed to resting orders.
+- **Respect `market.tick`, `min_price`, `max_price`.** `_clamp_to_tick()`
+  handles this.
+- **Read `order_rejected` output.** A silent bot that placed nothing usually
+  logged the reason there.
+
+## Writing your strategy
+
+Everything lives in one method:
+
+```python
+def _on_book_update(self, book, best_bid, best_ask):
+    ...
+```
+
+`book` is the list of resting `Order` objects (yours have `order.mine == True`),
+`best_bid` / `best_ask` are cents or `None`. Send orders with
+`self._send_limit(OrderSide.BUY, price, units)` and cancel with
+`self._cancel(order)`.
+
+The included example only crosses the spread when the price clears a fixed
+threshold (`MAX_BUY_PRICE` / `MIN_SELL_PRICE`) — it's a starting point for the
+week 3 setting, not a strategy that will win the graded task.
