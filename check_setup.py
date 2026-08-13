@@ -41,7 +41,9 @@ for name in EXPECTED_NAMES:
 # --- Agent callbacks bot.py overrides -------------------------------------
 EXPECTED_METHODS = ["initialised", "pre_start_tasks", "received_session_info",
                     "received_holdings", "received_orders", "order_accepted",
-                    "order_rejected", "send_order", "run", "inform", "error"]
+                    "order_rejected", "send_order", "run", "inform", "error",
+                    "warning", "is_session_active", "execute_periodically",
+                    "pending_outgoing_orders_count"]
 
 missing_methods = []
 if hasattr(fmclient, "Agent"):
@@ -64,7 +66,9 @@ if hasattr(fmclient, "Agent"):
 # --- Order construction helpers -------------------------------------------
 if hasattr(fmclient, "Order"):
     print("\nOrder helpers:")
-    for name in ["create_new", "create_cancel"]:
+    # No create_cancel in fmclient 6 -- cancels are a copy with
+    # order_type = OrderType.CANCEL. See MyBot._cancel in bot.py.
+    for name in ["create_new", "my_current", "current"]:
         ok = hasattr(fmclient.Order, name)
         print(f"  {'ok     ' if ok else 'MISSING'} Order.{name}")
         if not ok:
@@ -75,6 +79,31 @@ for enum_name in ["OrderSide", "OrderType"]:
     if enum is not None:
         members = [m for m in dir(enum) if m.isupper()]
         print(f"\n{enum_name} members: {', '.join(members)}")
+
+# --- ORM attribute names bot.py reads -------------------------------------
+# Instance attributes (market.tick, holdings.cash_available, ...) don't show
+# up in dir() of the class, so print each __init__ signature too -- that is
+# where the real attribute names are visible.
+print("\n" + "-" * 70)
+print("ORM classes -- check these names match what bot.py reads")
+print("-" * 70)
+
+for cls_name in ["Market", "Holding", "Asset", "Session", "Order"]:
+    cls = getattr(fmclient, cls_name, None)
+    if cls is None:
+        print(f"\n{cls_name}: NOT EXPORTED")
+        continue
+    try:
+        sig = inspect.signature(cls.__init__)
+    except (TypeError, ValueError):
+        sig = "(unavailable)"
+    print(f"\n{cls_name}.__init__{sig}")
+    props = sorted(
+        n for n in dir(cls)
+        if not n.startswith("_") and isinstance(getattr(cls, n, None), property)
+    )
+    if props:
+        print(f"  properties: {', '.join(props)}")
 
 # --- full surface, so a mismatch can be diagnosed from one run -------------
 if missing_names or missing_methods:

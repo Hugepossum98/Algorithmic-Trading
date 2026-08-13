@@ -13,6 +13,7 @@ practice session while you watch what the callbacks print.
 Prices in fmclient are INTEGER CENTS, not dollars. $2.50 is 250.
 """
 
+import copy
 import json
 import os
 from pathlib import Path
@@ -49,9 +50,6 @@ ENABLE_EXAMPLE_STRATEGY = False
 MAX_BUY_PRICE = 400  # never pay more than this
 MIN_SELL_PRICE = 600  # never sell for less than this
 ORDER_UNITS = 1
-
-# Seconds fmclient waits before acting on a callback. 0 is fine for class.
-EXECUTION_DELAY = 0.0
 
 
 def load_credentials():
@@ -91,14 +89,9 @@ class MyBot(Agent):
 
     def __init__(self, account, email, password, marketplace_id):
         super().__init__(account, email, password, marketplace_id, name=BOT_NAME)
-        self.execution_delay = EXECUTION_DELAY
 
         # The market we trade. Set in initialised() once we see what exists.
         self._market = None
-
-        # Ref of the order we have in flight. fmclient will reject a second
-        # order while the first is still pending, so we send one at a time.
-        self._pending_ref = None
         self._order_count = 0
 
         # Latest holdings, refreshed by received_holdings().
@@ -111,8 +104,10 @@ class MyBot(Agent):
         """Called once after login, when market metadata has arrived."""
         for market_id, market in self.markets.items():
             self.inform(
-                f"Market {market_id}: item={market.item} "
-                f"min={market.min_price} max={market.max_price} tick={market.tick}"
+                f"Market {market_id}: item={getattr(market, 'item', '?')} "
+                f"min={getattr(market, 'min_price', '?')} "
+                f"max={getattr(market, 'max_price', '?')} "
+                f"tick={getattr(market, 'tick', '?')}"
             )
 
         # Single-market sessions: just take the one we were given.
@@ -120,7 +115,7 @@ class MyBot(Agent):
         if self._market is None:
             self.error("No markets visible for this marketplace id.")
         else:
-            self.inform(f"Trading market: {self._market.item}")
+            self.inform(f"Trading market: {getattr(self._market, 'item', '?')}")
 
     def pre_start_tasks(self):
         """Register repeating jobs here, before the event loop starts.
@@ -132,41 +127,42 @@ class MyBot(Agent):
 
     def received_session_info(self, session: Session):
         """Market opened or closed."""
-        if session.is_open:
-            self.inform("Market is now OPEN.")
-        elif session.is_closed:
-            self.inform("Market is now CLOSED.")
-            self._pending_ref = None
+        if self.is_session_active():
+            self.inform("Session is ACTIVE -- trading allowed.")
+        else:
+            self.inform("Session is INACTIVE -- orders will be rejected.")
 
     # -- market data -------------------------------------------------------
 
     def received_holdings(self, holdings: Holding):
         """Your cash and units. 'available' excludes what is tied up in orders."""
-        self._cash_available = holdings.cash_available
-        for market, asset in holdings.assets.items():
-            if self._market is not None and market.fm_id == self._market.fm_id:
-                self._units_available = asset.units_available
+        self._cash_available = getattr(holdings, "cash_available", 0)
+        for market, asset in (getattr(holdings, "assets", None) or {}).items():
+            if self._is_my_market(market):
+                self._units_available = getattr(asset, "units_available", 0)
 
         self.inform(
-            f"Holdings: cash={holdings.cash} available={holdings.cash_available} "
+            f"Holdings: cash={getattr(holdings, 'cash', '?')} "
+            f"available={self._cash_available} "
             f"units_available={self._units_available}"
         )
 
     def received_orders(self, orders):
         """The current order book, resent on every change.
 
-        `orders` is the whole book, not a delta. Orders you placed have
-        order.mine == True.
+        `orders` is the whole book, not a delta. Use Order.my_current() to
+        see just your own live orders.
         """
         if self._market is None:
             return
 
-        book = [o for o in orders if o.market.fm_id == self._market.fm_id]
+        book = [o for o in orders if self._is_my_market(getattr(o, "market", None))]
         best_bid, best_ask = self._best_prices(book)
+        mine = len(Order.my_current())
 
         self.inform(
             f"Book: best_bid={best_bid} best_ask={best_ask} "
-            f"({len(book)} orders, {sum(1 for o in book if o.mine)} mine)"
+            f"({len(book)} orders, {mine} mine)"
         )
 
         self._on_book_update(book, best_bid, best_ask)
@@ -174,15 +170,13 @@ class MyBot(Agent):
     # -- order feedback ----------------------------------------------------
 
     def order_accepted(self, order: Order):
-        self.inform(f"Order ACCEPTED: ref={order.ref} {order.order_side} "
-                    f"{order.units}@{order.price}")
-        if order.ref == self._pending_ref:
-            self._pending_ref = None
+        self.inform(f"Order ACCEPTED: ref={getattr(order, 'ref', None)} "
+                    f"{getattr(order, 'order_side', '?')} "
+                    f"{getattr(order, 'units', '?')}@{getattr(order, 'price', '?')}")
 
-    def order_rejected(self, info, order: Order):
+    def order_rejected(self, info: dict, order: Order):
+        """`info` is a dict explaining why -- always read it."""
         self.error(f"Order REJECTED: ref={getattr(order, 'ref', None)} -- {info}")
-        if getattr(order, "ref", None) == self._pending_ref:
-            self._pending_ref = None
 
     # -- strategy ----------------------------------------------------------
 
@@ -197,8 +191,10 @@ class MyBot(Agent):
         if not ENABLE_EXAMPLE_STRATEGY:
             return
 
-        if self._pending_ref is not None:
-            return  # wait for the in-flight order to resolve
+        # Don't stack orders: wait for anything in flight to be accepted or
+        # rejected first, otherwise the marketplace rejects the extras.
+        if self.pending_outgoing_orders_count(self._market) > 0:
+            return
 
         # Example: cross the spread only when the price is clearly good for us.
         # Buy into a cheap ask.
@@ -215,6 +211,15 @@ class MyBot(Agent):
 
     # -- helpers -----------------------------------------------------------
 
+    def _is_my_market(self, market):
+        """True if `market` is the one we trade."""
+        if market is None or self._market is None:
+            return False
+        if market is self._market:
+            return True
+        mine = getattr(self._market, "fm_id", None)
+        return mine is not None and getattr(market, "fm_id", None) == mine
+
     def _best_prices(self, book):
         bids = [o.price for o in book if o.order_side == OrderSide.BUY]
         asks = [o.price for o in book if o.order_side == OrderSide.SELL]
@@ -222,6 +227,10 @@ class MyBot(Agent):
 
     def _send_limit(self, side, price, units):
         """Build and send a limit order, with basic sanity checks."""
+        if not self.is_session_active():
+            self.warning("Session not active -- not sending.")
+            return
+
         price = self._clamp_to_tick(price)
         if price is None:
             return
@@ -234,24 +243,37 @@ class MyBot(Agent):
 
         self._order_count += 1
         order.ref = f"{BOT_NAME}-{self._order_count}"
-        self._pending_ref = order.ref
 
         self.inform(f"Sending {side} {units}@{price} (ref={order.ref})")
         self.send_order(order)
 
     def _cancel(self, order: Order):
-        cancel = Order.create_cancel(order)
-        cancel.ref = f"cancel-{order.ref}"
+        """Cancel a live order of yours.
+
+        fmclient 6 has no Order.create_cancel(): you copy the order you want
+        gone and flip its type to OrderType.CANCEL.
+        """
+        cancel = copy.copy(order)
+        cancel.order_type = OrderType.CANCEL
+        cancel.ref = f"cancel-{getattr(order, 'ref', 'order')}"
+        self.inform(f"Cancelling ref={getattr(order, 'ref', None)}")
         self.send_order(cancel)
+
+    def _cancel_all_mine(self):
+        """Pull all of your resting orders. Handy at session end."""
+        for order in Order.my_current().values():
+            self._cancel(order)
 
     def _clamp_to_tick(self, price):
         """Round to the market tick and reject prices outside the legal range."""
         market = self._market
-        tick = market.tick or 1
+        tick = getattr(market, "tick", None) or 1
         price = int(round(price / tick) * tick)
-        if price < market.min_price or price > market.max_price:
-            self.warning(f"Price {price} outside [{market.min_price}, "
-                         f"{market.max_price}] -- not sending.")
+
+        low = getattr(market, "min_price", None)
+        high = getattr(market, "max_price", None)
+        if (low is not None and price < low) or (high is not None and price > high):
+            self.warning(f"Price {price} outside [{low}, {high}] -- not sending.")
             return None
         return price
 

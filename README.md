@@ -111,7 +111,25 @@ your own logic — so it's safe to run while you watch the callbacks fire.
 - **Respect `market.tick`, `min_price`, `max_price`.** `_clamp_to_tick()`
   handles this.
 - **Read `order_rejected` output.** A silent bot that placed nothing usually
-  logged the reason there.
+  logged the reason there. `info` is a dict with the reason in it.
+- **There is no `Order.create_cancel()` in fmclient 6.** To cancel, copy the
+  order and set `order_type = OrderType.CANCEL` — `_cancel()` does this.
+
+## Version note
+
+Written against **fmclient 6.0.1b0** (the Canvas wheel). The useful bits of
+that API:
+
+| Call | Use |
+| --- | --- |
+| `Order.create_new(market)` | Build a new order |
+| `Order.my_current()` | Dict of your own live orders |
+| `Order.current()` | Dict of every live order |
+| `self.pending_outgoing_orders_count(market)` | Orders you've sent that haven't landed yet |
+| `self.is_session_active()` | Whether trading is open right now |
+| `self.execute_periodically(fn, secs)` | Run something on a timer |
+
+Re-run `check_setup.py` if the wheel is ever updated.
 
 ## Writing your strategy
 
