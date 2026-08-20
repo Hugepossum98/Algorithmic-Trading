@@ -24,3 +24,7 @@ logs/
 .vscode/
 .idea/
 .DS_Store
+
+# Bot logs and pid tracking
+logs/
+.bots.pid

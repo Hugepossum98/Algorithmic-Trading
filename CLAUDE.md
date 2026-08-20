@@ -6,10 +6,21 @@ marketplace against the rest of the class.
 ## Run
 
 ```powershell
-.\venv\Scripts\Activate.ps1
-python bot.py            # terminal 1 -- private market
-python reactivebot.py    # terminal 2 -- public market
+.\trade.ps1 start      # both bots, background
+.\trade.ps1 logs       # follow both logs (Ctrl+C stops watching, not the bots)
+.\trade.ps1 status     # running? what is the position?
+.\trade.ps1 stop       # stop both
+.\trade.ps1 panic      # cancel every resting order NOW
 ```
+
+`trade.ps1` calls `venv\Scripts\python.exe` directly, so there is no venv to
+activate. To run a bot in the foreground instead:
+`.\venv\Scripts\python.exe bot.py`.
+
+**Stopping a process does not cancel its resting orders.** They stay live and
+can still fill, which is how a "stopped" bot ends a cycle off baseline. After
+any hard stop, run `.\trade.ps1 panic`. Panic cancels orders only — it does
+not trade back to baseline, because that needs a price decision.
 
 `credentials.json` (git-ignored) holds the password. `config.py` holds
 everything else. Never put the password in a tracked file — this repo is
