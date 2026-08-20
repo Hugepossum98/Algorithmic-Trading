@@ -1,12 +1,55 @@
-# Algorithmic Trading — AdHocMarkets bot
+# Algorithmic Trading — AdHocMarkets bots
 
-Python bot template for the class trading sessions, built on `fmclient`.
+Two bots for the class trading sessions, built on `fmclient`.
+
+## Daily workflow
+
+Open PowerShell. **Always start by going to the folder** — every command
+below assumes you are in it:
+
+```powershell
+cd C:\Users\jeded\Algorithmic-Trading
+```
+
+Then:
+
+```powershell
+git pull              # get the latest code
+.\trade.ps1 start     # start both bots
+.\trade.ps1 logs      # watch them (Ctrl+C stops watching, not the bots)
+.\trade.ps1 status    # running? what is my position?
+.\trade.ps1 stop      # stop both
+.\trade.ps1 panic     # cancel leftover orders -- ALWAYS after a stop
+```
+
+That is the whole thing. VS Code is optional: it is a text editor for
+reading these files, nothing more.
+
+### How the pieces fit
+
+| Where | What it is |
+| --- | --- |
+| **GitHub** | Cloud copy of the code. Nothing runs here. |
+| **`C:\Users\jeded\Algorithmic-Trading`** | The real thing. Code, `venv`, `credentials.json`. Everything runs here. |
+| **VS Code** | An editor for looking at the files. Changes nothing by itself. |
+
+`git pull` is the only link between them: it copies GitHub's version into
+your folder. `git push` sends yours back up.
+
+**Avoid editing a file that someone else is also editing** — that is what
+causes merge conflicts. Coordinate on `config.py` especially.
+
+## The files
 
 | File | What it's for |
 | --- | --- |
-| `bot.py` | The bot. Edit the CONFIG block and `_on_book_update()`. |
-| `check_setup.py` | Run before class — confirms `fmclient` is installed and matches `bot.py`. |
-| `credentials.example.json` | Copy to `credentials.json` (git-ignored) and fill in. |
+| `trade.ps1` | Start/stop/status/logs/panic. Your main entry point. |
+| `config.py` | **All parameters.** `TARGET_UNITS` is the one that matters most. |
+| `bot.py` | Normal bot — private market, opens positions. |
+| `reactivebot.py` | Reactive bot — public market, closes positions. |
+| `panic.py` | Cancels every resting order. Run after any hard stop. |
+| `check_setup.py` | Pre-class check that `fmclient` is installed and matches. |
+| `credentials.json` | Your password. Git-ignored — never commit it. |
 
 ## Setup
 
