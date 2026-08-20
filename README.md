@@ -140,6 +140,23 @@ first market, holding, and order the server sends, once each, tagged
 log. Every ORM read goes through a `getattr` default, so a name that doesn't
 match logs `?` rather than crashing the bot mid-session.
 
+## Which market is which
+
+The bot trades two books: the manager's **private** market and the **public**
+market. Getting them backwards is the most expensive mistake it can make, so
+the assignment is resolved in three stages:
+
+1. `PRIVATE_MARKET_ITEM` in the config, if you set it — explicit wins.
+2. Otherwise a name guess: the market whose item contains your account name
+   or the word "private".
+3. Either way, the first order flagged `is_private` **confirms** it — that
+   order can only exist in the private market. A wrong guess is corrected
+   here, with a warning.
+
+If stage 1 and 2 both fail, the bot **refuses to trade** and waits for stage 3
+rather than picking by dictionary order. Watch for `PRIVATE market confirmed`
+in the log before trusting a session.
+
 ## Inventory discipline (the cycle rule)
 
 The manager hands out a private order roughly every 60 seconds, and you must

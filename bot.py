@@ -37,15 +37,28 @@ from fmclient import Agent, Holding, Market, Order, OrderSide, OrderType, Sessio
 # --------------------------------------------------------------------------
 # CONFIG
 # --------------------------------------------------------------------------
-# NOTE: this repository is public. Prefer credentials.json (git-ignored) over
-# putting real values here -- see README.md.
+# This repository is PUBLIC. Real values belong in credentials.json, which is
+# git-ignored -- see README.md. These placeholders are only a fallback.
+#
+#   credentials.json:
+#   {
+#     "account": "your-account-name",
+#     "email": "you@student.unimelb.edu.au",
+#     "password": "your-password",
+#     "marketplace_id": 3265
+#   }
 
-ACCOUNT = "jocund-value"
-EMAIL = "jvandersteen@student.unimelb.edu.au"
-PASSWORD = ""
-MARKETPLACE_ID = 3265  # integer id given in class
+ACCOUNT = "<your account name>"
+EMAIL = "<your email>"
+PASSWORD = "<your password>"
+MARKETPLACE_ID = 0
 
 BOT_NAME = "MyBot"
+
+# Item name (or fragment) of the manager's private market. Leave blank to let
+# the bot work it out: it guesses from the name, then confirms definitively
+# from the first order flagged is_private. Set this if the guess is wrong.
+PRIVATE_MARKET_ITEM = ""
 
 # Safety switch. False = watch the market, place no orders.
 ENABLE_EXAMPLE_STRATEGY = True
@@ -102,10 +115,15 @@ def load_credentials():
 
     creds["marketplace_id"] = int(creds["marketplace_id"])
 
-    if str(creds["email"]).startswith("<"):
+    unset = [key for key, value in creds.items()
+             if str(value).startswith("<") or value in ("", 0)]
+    if unset:
         raise SystemExit(
-            "Credentials not set. Edit the CONFIG block in bot.py, or create "
-            "credentials.json (see README.md)."
+            f"Credentials missing or blank: {', '.join(sorted(unset))}.\n"
+            f"Create {cred_file.name} next to bot.py:\n"
+            '  {"account": "...", "email": "...", "password": "...", '
+            '"marketplace_id": 3265}\n'
+            "It is git-ignored, so your password stays out of this public repo."
         )
     return creds
 
@@ -147,26 +165,36 @@ class MyBot(Agent):
             self.inform(f"Market {market_id} visible: item={item_name}")
             self._dump_attrs("Market", market)
 
-            # Heuristic: the private market usually has your account name or
-            # 'private' in it.
-            if ACCOUNT.lower() in item_name.lower() or "private" in item_name.lower():
+            if PRIVATE_MARKET_ITEM:
+                # Explicit config wins over any guessing.
+                if PRIVATE_MARKET_ITEM.lower() in item_name.lower():
+                    self._private_market = market
+                else:
+                    self._public_market = market
+            elif ACCOUNT.lower() in item_name.lower() or "private" in item_name.lower():
                 self._private_market = market
             else:
                 self._public_market = market
 
-        # Fallback if the naming convention is completely different
-        if not self._private_market and len(self.markets) >= 2:
-            markets_list = list(self.markets.values())
-            self._private_market = markets_list[0]
-            self._public_market = markets_list[1]
-
-        if not self._public_market or not self._private_market:
-            self.error("CRITICAL: Could not find both a Public and Private market!")
-        else:
+        if self._public_market and self._private_market:
             self.inform(f"Assigned PRIVATE market: "
                         f"{getattr(self._private_market, 'item', '?')}")
             self.inform(f"Assigned PUBLIC market: "
                         f"{getattr(self._public_market, 'item', '?')}")
+            return
+
+        # The name heuristic did not resolve it. Do NOT guess by dict order:
+        # getting this backwards means sniping the wrong book. Wait instead --
+        # the first order flagged is_private identifies the private market
+        # for certain, and _adopt_private_market() fixes the assignment then.
+        self._private_market = None
+        self._public_market = None
+        self.warning(
+            "Could not identify the private market by name. Holding off "
+            "trading until an order flagged is_private arrives, which "
+            "identifies it definitively. Set PRIVATE_MARKET_ITEM in the "
+            "config to skip this wait."
+        )
 
     def pre_start_tasks(self):
         """The cycle tick is what makes the unwind reliable.
@@ -175,6 +203,7 @@ class MyBot(Agent):
         near the end of a cycle would otherwise leave a position stranded.
         """
         self.execute_periodically(self._cycle_tick, 1)
+        self.execute_periodically(self._heartbeat, 15)
 
     def received_session_info(self, session: Session):
         if getattr(session, "is_open", False):
@@ -217,13 +246,15 @@ class MyBot(Agent):
 
     def received_orders(self, orders):
         """Split the master order book into Public and Private books."""
-        if not self._public_market or not self._private_market:
-            return
-
         if orders:
             self._dump_attrs("Order", orders[0])
 
+        # Must run BEFORE the guard below: when the markets are unresolved
+        # this is the only thing that can resolve them.
         self._detect_private_orders(orders)
+
+        if not self._public_market or not self._private_market:
+            return
 
         pub_book = [o for o in orders
                     if getattr(o, "market", None) == self._public_market]
@@ -271,7 +302,7 @@ class MyBot(Agent):
         priv_best_bid, priv_best_ask = self._best_prices(other_priv)
 
         tick = getattr(self._public_market, "tick", 1) or 1
-        max_pub_units = getattr(self._public_market, "unitMaximum", ORDER_UNITS)
+        max_pub_units = self._max_units(self._public_market)
 
         net = self._net_units()
         unwinding = self._seconds_left() <= UNWIND_BUFFER_SECONDS
@@ -376,11 +407,43 @@ class MyBot(Agent):
             if key in self._seen_private:
                 continue
             self._seen_private.add(key)
+            self._adopt_private_market(order)
             self.inform(
                 f"PRIVATE ORDER: {getattr(order, 'order_side', '?')} "
                 f"{getattr(order, 'units', '?')}@{getattr(order, 'price', '?')}"
             )
             self._start_cycle()
+
+    def _adopt_private_market(self, private_order):
+        """Let a genuinely private order settle which market is which.
+
+        This is the authoritative signal -- the name heuristic is only a
+        guess, and trading the two books the wrong way round is the most
+        expensive mistake this bot can make.
+        """
+        market = getattr(private_order, "market", None)
+        if market is None or market is self._private_market:
+            return
+
+        if self._private_market is not None:
+            self.warning(
+                f"Private market was "
+                f"{getattr(self._private_market, 'item', '?')}, but an "
+                f"is_private order arrived in "
+                f"{getattr(market, 'item', '?')} -- correcting."
+            )
+
+        self._private_market = market
+        others = [m for m in self.markets.values() if m is not market]
+        self._public_market = others[0] if len(others) == 1 else None
+
+        self.inform(f"PRIVATE market confirmed: {getattr(market, 'item', '?')}")
+        if self._public_market is not None:
+            self.inform(f"PUBLIC market: "
+                        f"{getattr(self._public_market, 'item', '?')}")
+        else:
+            self.error(f"{len(others)} candidate public markets -- cannot "
+                       f"pick one. Set PRIVATE_MARKET_ITEM in the config.")
 
     def _order_key(self, order):
         for attr in ("fm_id", "id", "ref"):
@@ -453,6 +516,27 @@ class MyBot(Agent):
         for name, value in sorted(attrs.items()):
             self.inform(f"[attrs]   {name} = {value!r}")
 
+    def _max_units(self, market):
+        """Largest order size this market accepts.
+
+        The attribute name is not confirmed -- fmclient's ORM builds these at
+        runtime -- so try the plausible spellings and say so once if none
+        match, rather than silently capping every order at ORDER_UNITS.
+        """
+        for name in ("unitMaximum", "unit_maximum", "max_units", "maxUnits"):
+            value = getattr(market, name, None)
+            if isinstance(value, int) and value > 0:
+                return value
+
+        if "max_units" not in self._dumped:
+            self._dumped.add("max_units")
+            self.warning(
+                f"No max-units attribute on this market; capping orders at "
+                f"ORDER_UNITS={ORDER_UNITS}. Check the [attrs] dump for the "
+                f"real name and add it to _max_units()."
+            )
+        return ORDER_UNITS
+
     def _clear_blocking_orders(self, my_orders, wanted_side, wanted_price):
         """Cancel anything of ours that is not the order we want resting.
 
@@ -517,10 +601,6 @@ class MyBot(Agent):
         cancel.ref = f"cancel-{getattr(order, 'ref', 'order')}"
         self.inform(f"Cancelling ref={getattr(order, 'ref', None)}")
         self.send_order(cancel)
-
-    def _cancel_all_mine(self):
-        for order in Order.my_current().values():
-            self._cancel(order)
 
     def _clamp_to_tick(self, market, price):
         tick = getattr(market, "tick", None) or 1
