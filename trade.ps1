@@ -1,12 +1,8 @@
 <#
-    Control script for both bots.
+    Control script for both bots.  Run  .\trade.ps1 help  for the full list.
 
-        .\trade.ps1 start     launch both bots in the background
-        .\trade.ps1 stop      stop them
-        .\trade.ps1 status    are they running? what is the position?
-        .\trade.ps1 logs      follow both logs live (Ctrl+C to stop watching)
-        .\trade.ps1 restart   stop, then start
-        .\trade.ps1 panic     cancel every resting order NOW
+        start / stop / restart / status / logs / panic
+        set / config / creds / edit / check / update
 
     No venv activation needed -- the script calls venv\Scripts\python.exe
     directly, which is exactly equivalent and one less thing to forget.
@@ -14,8 +10,12 @@
 
 param(
     [Parameter(Position = 0)]
-    [ValidateSet("start", "stop", "status", "logs", "restart", "panic")]
-    [string]$Command = "status"
+    [ValidateSet("start", "stop", "status", "logs", "restart", "panic",
+                 "set", "config", "creds", "edit", "check", "update", "help")]
+    [string]$Command = "help",
+
+    [Parameter(Position = 1, ValueFromRemainingArguments = $true)]
+    [string[]]$Rest
 )
 
 $ErrorActionPreference = "Stop"
@@ -157,12 +157,79 @@ function Watch-Logs {
     finally { $jobs | Stop-Job -PassThru | Remove-Job }
 }
 
+function Set-Creds {
+    Write-Host "Writing credentials.json (git-ignored -- never committed).`n"
+    $account = Read-Host "Account name    [jocund-value]"
+    if (-not $account) { $account = "jocund-value" }
+    $email = Read-Host "Email           [jvanderstee@student.unimelb.edu.au]"
+    if (-not $email) { $email = "jvanderstee@student.unimelb.edu.au" }
+    $market = Read-Host "Marketplace id  [3266]"
+    if (-not $market) { $market = "3266" }
+
+    # Read-Host -AsSecureString keeps the password off the screen and out of
+    # your PowerShell command history.
+    $secure = Read-Host "Password" -AsSecureString
+    $plain = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+        [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
+    if (-not $plain) { Write-Host "No password given, nothing written." -ForegroundColor Yellow; return }
+
+    @{
+        account        = $account
+        email          = $email
+        password       = $plain
+        marketplace_id = [int]$market
+    } | ConvertTo-Json | Set-Content (Join-Path $Root "credentials.json")
+
+    Write-Host "`nSaved credentials.json for $account on marketplace $market." -ForegroundColor Green
+    if (Get-RunningBots) { Write-Host "Restart to pick it up:  .\trade.ps1 restart" -ForegroundColor Yellow }
+}
+
+function Show-Help {
+    Write-Host @"
+
+  Bot control -- run these from $Root
+
+  RUNNING
+    .\trade.ps1 start           start both bots in the background
+    .\trade.ps1 stop            stop them
+    .\trade.ps1 restart         stop, then start (use after changing settings)
+    .\trade.ps1 status          running? what is my position?
+    .\trade.ps1 logs            follow both logs (Ctrl+C stops watching only)
+    .\trade.ps1 panic           cancel every resting order NOW
+
+  SETTINGS
+    .\trade.ps1 set             list every setting and its value
+    .\trade.ps1 set MIN_EDGE    show just that one
+    .\trade.ps1 set MIN_EDGE 50 change it (validated before saving)
+    .\trade.ps1 config          open config.py in an editor
+    .\trade.ps1 creds           set account + password (prompts, hidden)
+
+  CODE
+    .\trade.ps1 edit            open the whole project in VS Code
+    .\trade.ps1 update          git pull the latest code
+    .\trade.ps1 check           verify the fmclient install
+
+  Settings worth knowing:
+    TARGET_UNITS   units you must hold at the start of each cycle
+    MIN_EDGE       cents per unit needed before taking a private order
+                   (set to 500 for a dry run that places no orders)
+
+"@ -ForegroundColor Cyan
+}
+
 switch ($Command) {
     "start"   { Start-Bots }
     "stop"    { Stop-Bots }
     "status"  { Show-Status }
     "logs"    { Watch-Logs }
     "restart" { Stop-Bots; Start-Sleep -Seconds 2; Start-Bots }
+    "help"    { Show-Help }
+    "creds"   { Set-Creds }
+    "set"     { & $Python (Join-Path $Root "setparam.py") @Rest }
+    "check"   { & $Python (Join-Path $Root "check_setup.py") }
+    "update"  { git -C $Root pull }
+    "config"  { code (Join-Path $Root "config.py") }
+    "edit"    { code $Root }
     "panic"   {
         Assert-Setup
         Write-Host "Cancelling every resting order..." -ForegroundColor Red
