@@ -290,13 +290,12 @@ class MyBot(Agent):
             else:
                 ideal_price = pub_best_bid if pub_best_bid else MIN_SELL_PRICE
 
-            # Stale order check: reprice if our resting order is off.
-            if my_pub_orders:
-                for order in my_pub_orders:
-                    if order.order_side == OrderSide.SELL and order.price != ideal_price:
-                        self._cancel(order)
-                        return  # let the cancel land first
-                return  # already at the ideal price, wait for the fill
+            # Stale order check. Anything of ours that is not a sell at the
+            # ideal price is in the way -- a resting BUY here would otherwise
+            # block the unwind forever, since it can never reduce a long.
+            if self._clear_blocking_orders(my_pub_orders, OrderSide.SELL,
+                                           ideal_price):
+                return
 
             units_to_sell = min(net, self._units_available, max_pub_units)
             if units_to_sell <= 0:
@@ -317,11 +316,8 @@ class MyBot(Agent):
             else:
                 ideal_price = pub_best_ask if pub_best_ask else MAX_BUY_PRICE
 
-            if my_pub_orders:
-                for order in my_pub_orders:
-                    if order.order_side == OrderSide.BUY and order.price != ideal_price:
-                        self._cancel(order)
-                        return
+            if self._clear_blocking_orders(my_pub_orders, OrderSide.BUY,
+                                           ideal_price):
                 return
 
             affordable = self._cash_available // ideal_price if ideal_price else 0
@@ -456,6 +452,27 @@ class MyBot(Agent):
         self.inform(f"[attrs] {label} ({type(obj).__name__}):")
         for name, value in sorted(attrs.items()):
             self.inform(f"[attrs]   {name} = {value!r}")
+
+    def _clear_blocking_orders(self, my_orders, wanted_side, wanted_price):
+        """Cancel anything of ours that is not the order we want resting.
+
+        Returns True if the caller should stop for now -- either a cancel is
+        in flight, or the right order is already sitting at the right price.
+
+        Checking only same-side orders here was a real deadlock: a leftover
+        BUY while we were long matched no cancel branch, yet still counted as
+        "we have an order", so the sell was never sent and the cycle ended
+        off baseline.
+        """
+        if not my_orders:
+            return False
+
+        for order in my_orders:
+            if order.order_side != wanted_side or order.price != wanted_price:
+                self._cancel(order)
+                return True  # let the cancel land before doing anything else
+
+        return True  # the order we want is already resting; wait for the fill
 
     def _best_prices(self, book):
         bids = [o.price for o in book if o.order_side == OrderSide.BUY]
