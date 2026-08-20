@@ -3,6 +3,45 @@
 University of Melbourne algorithmic trading class. Two bots trade one
 marketplace against the rest of the class.
 
+Account `jocund-value`, marketplace **3266**. Password lives only in
+`credentials.json`, which is git-ignored — **this repo is public**, so it
+must never reach a tracked file.
+
+## Setting up a fresh machine
+
+`fmclient` is **not on PyPI**. It ships as a wheel on Canvas
+(`fmclient-6.0.1b0-py3-none-any.whl`) and must be downloaded first.
+
+```powershell
+git clone https://github.com/Hugepossum98/Algorithmic-Trading.git
+cd Algorithmic-Trading
+py -3.12 -m venv venv
+.\venv\Scripts\python.exe -m pip install "$HOME\Downloads\fmclient-6.0.1b0-py3-none-any.whl"
+.\trade.ps1 creds          # prompts; password hidden
+.\trade.ps1 check          # must print "setup looks good"
+```
+
+Python 3.11 or 3.12. Do not use 3.13+ — the wheel is a beta and newer
+Pythons often have no compatible build.
+
+### Traps that cost real time on this project
+
+1. **Bare `pip` and `python` can resolve to different interpreters.** On
+   Windows the Microsoft Store Python installs execution aliases that shadow
+   a venv. Symptom: `Defaulting to user installation because normal
+   site-packages is not writeable` *while a venv is active*. Always use
+   `.\venv\Scripts\python.exe -m pip`, never bare `pip`.
+2. **VS Code's ▶ Run button picks the wrong interpreter** and fails with
+   `ModuleNotFoundError: No module named 'fmclient'`. Either run through
+   `trade.ps1`, which calls the venv python explicitly, or set the
+   interpreter once: Ctrl+Shift+P → `Python: Select Interpreter` → the
+   `('venv': venv)` entry.
+3. **Keep the project out of OneDrive.** A venv is thousands of small files;
+   OneDrive syncing them causes file-lock errors mid-session.
+4. **One clone only.** Two clones drift and you lose track of which is real.
+5. `source venv/bin/activate` is Unix. On PowerShell it is
+   `.\venv\Scripts\Activate.ps1` — though `trade.ps1` means you never need it.
+
 ## Run
 
 ```powershell
@@ -22,9 +61,24 @@ can still fill, which is how a "stopped" bot ends a cycle off baseline. After
 any hard stop, run `.\trade.ps1 panic`. Panic cancels orders only — it does
 not trade back to baseline, because that needs a price decision.
 
-`credentials.json` (git-ignored) holds the password. `config.py` holds
-everything else. Never put the password in a tracked file — this repo is
-public.
+Full command list: `.\trade.ps1 help`. Settings are changed without opening
+an editor via `.\trade.ps1 set NAME VALUE`, which validates before saving.
+`Trade.bat` is a double-clickable entry point that opens PowerShell already
+in the project folder.
+
+## The files
+
+| File | Role |
+| --- | --- |
+| `trade.ps1` | start/stop/restart/status/logs/panic/set/config/creds/edit/check/update |
+| `Trade.bat` | double-click entry point, pinnable to the taskbar |
+| `config.py` | every parameter, credential loading, market identification, `net_units()`, `urgency()` |
+| `bot.py` | NORMAL bot — private market only, opens positions |
+| `reactivebot.py` | REACTIVE bot — public market only, closes positions |
+| `panic.py` | cancels every resting order, reports whether position is at baseline |
+| `setparam.py` | backs `trade.ps1 set`; rewrites one assignment, compiles before saving |
+| `check_setup.py` | verifies the fmclient install, dumps its real API on mismatch |
+| `credentials.json` | password. Git-ignored. Never commit. |
 
 ## The setting
 
@@ -146,3 +200,44 @@ and check the market assignment, `TARGET_UNITS`, and the `[attrs]` names.
 - Read `order_rejected`'s `info` dict — a silent bot usually logged why there.
 - Test changes against the mock pattern in the git history rather than the
   live market.
+
+## How this was built, and how to change it safely
+
+No live marketplace has ever been touched. Every behaviour was verified
+against a hand-written mock shaped like the introspected fmclient 6.x API —
+a stub module defining `Agent`, `Order`, `Market`, `OrderSide`, `OrderType`
+with the same signatures, letting the callbacks be driven directly
+(`bot.received_orders([...])`) and the sent orders inspected.
+
+That mock encodes the same assumptions as the code, so **it cannot falsify
+them**. It catches logic errors, not wrong beliefs about fmclient.
+
+Scenarios currently covered: baseline preserved when flat, arbitrage snipe in
+both directions, `MIN_EDGE` respected, normal bot standing down while the
+reactive bot works, no position opened late in a cycle, the urgency ramp
+walking monotonically from patient to crossing, timer-driven unwind on a
+silent book, wrong-side order cancelled instead of deadlocking, leftover
+order pulled when flat, cycle rollover without double-counting, and panic's
+cancel-all with its two-sweep wait.
+
+Two bugs were found *by* that testing rather than by reading: a name
+collision where `_tick` was both the periodic task and a tick-size alias, and
+the frozen default argument in `net_units`. Both were silent failures. Keep
+driving the callbacks directly when changing strategy logic.
+
+## Session history
+
+Built in one session, in this order:
+
+1. Initial template against the v2-era fmclient API most examples show.
+2. `check_setup.py` run against the real Canvas wheel; API reconciled to 6.x.
+3. Reviewed and hardened: the unwind deadlock, market identification, the
+   credential guard, the silent size cap.
+4. Split into two bots by market — normal owns private, reactive owns public
+   — after the class setting was clarified.
+5. Blocks of 5 and the urgency ramp, once it was clear every student settles
+   inside the same minute.
+6. `trade.ps1`, `panic.py`, `setparam.py`, `Trade.bat` for live operation.
+
+PR #1 (merged) covers steps 1–3. `main` is behind the working branch
+`claude/python-algo-trading-setup-vr77v9`, which has everything.
