@@ -106,16 +106,13 @@ class Reactive(Agent):
                 return
             return
 
-        urgent = self._seconds_left() <= config.UNWIND_BUFFER_SECONDS
+        u = config.urgency(self._seconds_left())
+        urgent = u >= 1.0
         mine = {o.ref for o in Order.my_current().values()}
         bid, ask = self._best([o for o in self._pub_book if o.ref not in mine])
 
-        if self._net > 0:
-            side = OrderSide.SELL
-            price = self._sell_price(bid, ask, urgent)
-        else:
-            side = OrderSide.BUY
-            price = self._buy_price(bid, ask, urgent)
+        side = OrderSide.SELL if self._net > 0 else OrderSide.BUY
+        price = self._work_price(side, bid, ask, u)
 
         if price is None:
             self.warning(f"net {self._net:+d} but no price to work with.")
@@ -131,7 +128,10 @@ class Reactive(Agent):
                 return          # let the cancel land first
             return              # right order, right price -- wait for the fill
 
-        units = min(abs(self._net), config.MAX_POSITION)
+        # Work in slices while there is time; take the whole thing once the
+        # ramp is at full urgency, so we never end a cycle with a remainder.
+        units = abs(self._net) if urgent else min(abs(self._net),
+                                                  config.SLICE_UNITS)
         if side == OrderSide.SELL:
             units = min(units, self._units_free)
         else:
@@ -142,25 +142,51 @@ class Reactive(Agent):
                          f"(free={self._units_free} cash={self._cash}).")
             return
 
-        self.inform(f"{'CROSSING' if urgent else 'posting'} {side} "
-                    f"{units}@{price} to close {self._net:+d}")
+        self.inform(f"{'CROSSING' if urgent else 'working'} {side} "
+                    f"{units}@{price} to close {self._net:+d} "
+                    f"(urgency {u:.0%}, {self._seconds_left():.0f}s left)")
         self._send(side, price, units)
 
-    def _sell_price(self, bid, ask, urgent):
-        if urgent:
-            return bid          # hit the bid, take the fill now
-        if ask is not None:
-            return max(ask - self._tick_size(), bid) if bid is not None \
-                else ask - self._tick_size()
-        return bid
+    def _work_price(self, side, bid, ask, u):
+        """Walk the limit price from patient to aggressive as u goes 0 -> 1.
 
-    def _buy_price(self, bid, ask, urgent):
-        if urgent:
-            return ask          # lift the ask, take the fill now
-        if bid is not None:
-            return min(bid + self._tick_size(), ask) if ask is not None \
-                else bid + self._tick_size()
-        return ask
+        u = 0.0  post where we earn the spread (best price, one tick better
+                 than the current best on our side)
+        u = 1.0  cross and take whatever the other side is showing
+
+        Everything between is a linear walk. The point is to be finished
+        before the end-of-cycle crowd forces its way out at the worst
+        prices -- start ambitious, concede steadily, never get stuck.
+        """
+        tick = self._tick_size()
+
+        if side == OrderSide.SELL:
+            patient = (ask - tick) if ask is not None else bid
+            aggressive = bid if bid is not None else patient
+        else:
+            patient = (bid + tick) if bid is not None else ask
+            aggressive = ask if ask is not None else patient
+
+        if patient is None:
+            return None if aggressive is None else self._round(aggressive)
+        if aggressive is None:
+            return self._round(patient)
+
+        price = patient + (aggressive - patient) * u
+        return self._round(price)
+
+    def _round(self, price):
+        """Snap to the tick and keep inside the market's legal range."""
+        tick = self._tick_size()
+        price = int(round(price / tick) * tick)
+
+        low = getattr(self._public_market, "min_price", None)
+        high = getattr(self._public_market, "max_price", None)
+        if low is not None:
+            price = max(price, low)
+        if high is not None:
+            price = min(price, high)
+        return price
 
     # -- cycle -------------------------------------------------------------
 

@@ -18,8 +18,8 @@ from pathlib import Path
 # Password is NOT here: this repo is public. Put it in credentials.json
 # (git-ignored) or the FM_PASSWORD environment variable.
 ACCOUNT = "jocund-value"
-EMAIL = "jvandersteen@student.unimelb.edu.au"
-MARKETPLACE_ID = 3265
+EMAIL = "jvanderstee@student.unimelb.edu.au"
+MARKETPLACE_ID = 3266
 
 # -- the baseline ----------------------------------------------------------
 # Units you must be holding when each new private order arrives. BOTH bots
@@ -28,8 +28,16 @@ MARKETPLACE_ID = 3265
 TARGET_UNITS = 0
 
 # -- sizing ----------------------------------------------------------------
-ORDER_UNITS = 1        # units per order
-MAX_POSITION = 1       # never go further than this from TARGET_UNITS
+# The manager deals in blocks of 5, so a private order moves you 5 units and
+# the reactive bot has 5 to work back.
+ORDER_UNITS = 5
+MAX_POSITION = 5       # never go further than this from TARGET_UNITS
+
+# Unwind in slices rather than dumping all 5 at once. Smaller slices get
+# better average prices in a thin book but risk not finishing; the urgency
+# ramp below compensates by getting more aggressive as time runs out.
+# Set equal to ORDER_UNITS to always work the whole position at once.
+SLICE_UNITS = 5
 
 # -- entry rule (normal bot) -----------------------------------------------
 # Minimum profit, in cents, before the normal bot takes a private order.
@@ -47,6 +55,22 @@ ALLOW_SHORT = True
 # -- cycle clock (both bots) -----------------------------------------------
 CYCLE_SECONDS = 60           # how often the manager issues a private order
 UNWIND_BUFFER_SECONDS = 15   # last N seconds: stop opening, force the exit
+
+
+def urgency(seconds_left):
+    """How hard to chase the fill: 0.0 = patient, 1.0 = cross the spread.
+
+    Everyone in the class must settle inside the same minute, so the end of
+    a cycle is a predictable liquidity crunch -- a crowd of forced sellers
+    all crossing at once. Ramping continuously means we are done trading
+    before that crowd arrives, instead of being part of it.
+
+    Reaches 1.0 with UNWIND_BUFFER_SECONDS still on the clock, leaving that
+    window as margin to actually get filled.
+    """
+    span = max(1.0, CYCLE_SECONDS - UNWIND_BUFFER_SECONDS)
+    elapsed = CYCLE_SECONDS - seconds_left
+    return max(0.0, min(1.0, elapsed / span))
 
 # -- market identification -------------------------------------------------
 # Fragment of the private market's item name. Leave "" to auto-detect.
