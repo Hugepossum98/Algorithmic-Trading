@@ -10,19 +10,50 @@ Python bot template for the class trading sessions, built on `fmclient`.
 
 ## Setup
 
-`fmclient` is **not on PyPI** — download the wheel from Canvas first.
+`fmclient` is **not on PyPI** — download the wheel from Canvas first, and note
+where it saved (usually `Downloads`).
 
-```bash
-# 1. virtual environment (recommended over installing into system python)
-python3 -m venv venv
-source venv/bin/activate          # Windows: venv\Scripts\activate
+Use a virtual environment. Beyond being good practice, it guarantees `python`
+and `pip` refer to the *same* interpreter — if you have several Pythons
+installed, they often don't, and packages get installed where your script
+can't see them.
 
-# 2. install the wheel you downloaded from Canvas
-pip install ./fmclient-<version>-py3-none-any.whl
+fmclient is an older library, so prefer Python 3.11 or 3.12 if you have one.
+Very new versions (3.13+) frequently have no compatible build.
 
-# 3. verify
+### Windows (PowerShell)
+
+```powershell
+py -0                             # list your installed Pythons
+py -3.12 -m venv venv             # or py -3.11, or just py
+.\venv\Scripts\Activate.ps1       # prompt should now start with (venv)
+
+# use the REAL filename -- type "fmc" and press Tab to autocomplete
+pip install "$HOME\Downloads\fmclient-2.0.0-py3-none-any.whl"
+
 python check_setup.py
 ```
+
+If activation fails with an execution-policy error, allow it for that window
+only: `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass`
+
+### macOS / Linux
+
+```bash
+python3 -m venv venv
+source venv/bin/activate          # prompt should now start with (venv)
+
+# use the REAL filename of the wheel you downloaded
+pip install ~/Downloads/fmclient-2.0.0-py3-none-any.whl
+
+python check_setup.py
+```
+
+Both blocks show `fmclient-2.0.0-py3-none-any.whl` as an example — substitute
+whatever the Canvas file is actually called. Run `pip install` on a path that
+exists, or pip will tell you the file isn't there.
+
+Reactivate the venv (the activate line) in every new terminal you open.
 
 `check_setup.py` prints the API of the version you installed. If it reports
 `MISSING` for anything, the Canvas wheel differs from this template — adjust
@@ -30,8 +61,11 @@ python check_setup.py
 
 ## Credentials
 
+```powershell
+Copy-Item credentials.example.json credentials.json   # PowerShell
+```
 ```bash
-cp credentials.example.json credentials.json
+cp credentials.example.json credentials.json          # macOS / Linux
 ```
 
 Fill in your account name, email, password, and the marketplace id given in
@@ -77,7 +111,90 @@ your own logic — so it's safe to run while you watch the callbacks fire.
 - **Respect `market.tick`, `min_price`, `max_price`.** `_clamp_to_tick()`
   handles this.
 - **Read `order_rejected` output.** A silent bot that placed nothing usually
-  logged the reason there.
+  logged the reason there. `info` is a dict with the reason in it.
+- **There is no `Order.create_cancel()` in fmclient 6.** To cancel, copy the
+  order and set `order_type = OrderType.CANCEL` — `_cancel()` does this.
+
+## Version note
+
+Written against **fmclient 6.0.1b0** (the Canvas wheel). The useful bits of
+that API:
+
+| Call | Use |
+| --- | --- |
+| `Order.create_new(market)` | Build a new order |
+| `Order.my_current()` | Dict of your own live orders |
+| `Order.current()` | Dict of every live order |
+| `self.pending_outgoing_orders_count(market)` | Orders you've sent that haven't landed yet |
+| `self.is_session_active()` | Whether trading is open right now |
+| `self.execute_periodically(fn, secs)` | Run something on a timer |
+
+Re-run `check_setup.py` if the wheel is ever updated.
+
+fmclient's ORM classes (`Market`, `Holding`, `Asset`) build their attributes
+at runtime, so `check_setup.py` can't confirm names like `market.tick` or
+`holdings.cash_available` — only a live connection can. `bot.py` therefore
+ships with `DEBUG_DUMP_ATTRS = True`, which prints the real attributes of the
+first market, holding, and order the server sends, once each, tagged
+`[attrs]`. Read those on your first run, then set it to `False` to quiet the
+log. Every ORM read goes through a `getattr` default, so a name that doesn't
+match logs `?` rather than crashing the bot mid-session.
+
+## Which market is which
+
+The bot trades two books: the manager's **private** market and the **public**
+market. Getting them backwards is the most expensive mistake it can make, so
+the assignment is resolved in three stages:
+
+1. `PRIVATE_MARKET_ITEM` in the config, if you set it — explicit wins.
+2. Otherwise a name guess: the market whose item contains your account name
+   or the word "private".
+3. Either way, the first order flagged `is_private` **confirms** it — that
+   order can only exist in the private market. A wrong guess is corrected
+   here, with a warning.
+
+If stage 1 and 2 both fail, the bot **refuses to trade** and waits for stage 3
+rather than picking by dictionary order. Watch for `PRIVATE market confirmed`
+in the log before trusting a session.
+
+## Inventory discipline (the cycle rule)
+
+The manager hands out a private order roughly every 60 seconds, and you must
+be back at your baseline unit count before the next one lands. Every buy has
+to be paired with a sell inside the same cycle.
+
+`bot.py` enforces this rather than trusting the strategy to remember:
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `CYCLE_SECONDS` | `60` | Expected gap between private orders |
+| `UNWIND_BUFFER_SECONDS` | `15` | Stop opening, start flattening, this far from the end |
+| `MAX_OPEN_UNITS` | `1` | How far from baseline you may ever be |
+| `TARGET_UNITS` | `None` | Baseline; `None` captures whatever you hold at connect |
+| `ALLOW_LOSS_TO_FLATTEN` | `True` | Cross the spread if that's what being flat costs |
+
+How it behaves:
+
+1. **Baseline** is captured from your first holdings update and logged.
+2. **An open position is a debt.** While `net != 0` the bot only trades in the
+   direction that closes it — a cheap ask is ignored when you're already long.
+3. **Late in a cycle it stops opening.** Inside the unwind window, a flat bot
+   sits still rather than starting a round trip it can't finish.
+4. **The unwind is timer-driven**, not book-driven. `_on_book_update` only
+   fires when the book moves, so a quiet market would otherwise strand you
+   holding units. `_cycle_tick` runs every second regardless.
+5. **Resting orders get cancelled first** when flattening — they tie up the
+   very units and cash needed to get flat.
+6. **A cycle ending off baseline logs an error**, with the buy/sell counts. In
+   this setting that's the failure that matters most.
+
+Cycle boundaries are detected from the manager's order itself via
+`order.is_private`, with `CYCLE_SECONDS` as the fallback clock.
+
+`ALLOW_LOSS_TO_FLATTEN = True` means the bot will deliberately sell into a bad
+bid rather than carry a position across the boundary. That is usually the
+right trade in this setting, but it is a real cost — set it `False` if your
+lecturer's rules say otherwise.
 
 ## Writing your strategy
 
